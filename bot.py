@@ -14,6 +14,7 @@ import gzip
 import html as htmlmod
 import json
 import os
+import random
 import re
 import sys
 import time
@@ -148,27 +149,61 @@ def send(text, chat_id=None, buy_url=None, menu=False):
 
 # ---------- fetching ----------
 
+class FetchError(Exception):
+    def __init__(self, code):
+        super().__init__(f"HTTP {code}")
+        self.code = code
+
+
+try:
+    from curl_cffi import requests as _cffi   # looks like a real Chrome to Amazon
+    _SESSION = _cffi.Session(impersonate="chrome")
+    ENGINE = "chrome"
+except Exception:  # noqa: BLE001
+    import http.cookiejar
+    _SESSION = None
+    _OPENER = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+    ENGINE = "basic"
+
+_WARMED = set()
+
+
 def fetch(url):
+    if _SESSION is not None:
+        r = _SESSION.get(url, timeout=25, headers={"Accept-Language": "en-IN,en;q=0.9"})
+        if r.status_code != 200:
+            raise FetchError(r.status_code)
+        return r.text
     req = urllib.request.Request(url, headers={
         "User-Agent": UA,
-        "Accept": "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9,he;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-IN,en;q=0.9",
         "Accept-Encoding": "gzip, deflate",
         "Upgrade-Insecure-Requests": "1",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "Sec-Fetch-User": "?1",
-        "Cache-Control": "max-age=0",
     })
-    with urllib.request.urlopen(req, timeout=25) as r:
-        raw = r.read()
-        enc = r.headers.get("Content-Encoding", "")
+    try:
+        with _OPENER.open(req, timeout=25) as r:
+            raw = r.read()
+            enc = r.headers.get("Content-Encoding", "")
+    except urllib.error.HTTPError as e:
+        raise FetchError(e.code) from None
     if enc == "gzip":
         raw = gzip.decompress(raw)
     elif enc == "deflate":
         raw = zlib.decompress(raw)
     return raw.decode("utf-8", errors="replace")
+
+
+def warm_up(host):
+    """Visit the home page once so Amazon hands us normal cookies (like a real visitor)."""
+    if host in _WARMED:
+        return
+    _WARMED.add(host)
+    try:
+        fetch(f"https://{host}/")
+        time.sleep(random.uniform(2, 4))
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def amazon_parts(url):
@@ -239,23 +274,23 @@ def detect_amazon(page, seller=""):
 
 
 def check_amazon(url):
-    """Amazon often answers 503 to servers; try the desktop and mobile pages a few times."""
+    """One desktop try, then one mobile try. Never hammer Amazon with retries."""
     host, asin, seller = amazon_parts(url)
+    warm_up(host)
     suffix = f"?smid={seller}&psc=1" if seller else ""
-    urls = [f"https://{host}/dp/{asin}{suffix}", f"https://{host}/gp/aw/d/{asin}{suffix}"]
-    for attempt in range(3):
-        for u in urls:
-            try:
-                page = fetch(u)
-                status = detect_amazon(page, seller)
-                if status != "unknown":
-                    return status, page
-                print("  captcha / unclear page")
-            except urllib.error.HTTPError as e:
-                print(f"  HTTP {e.code} ({'mobile' if '/gp/aw/' in u else 'desktop'})")
-            except Exception as e:  # noqa: BLE001
-                print(f"  error: {e}")
-            time.sleep(3 + attempt * 4)
+    for kind, u in (("desktop", f"https://{host}/dp/{asin}{suffix}"),
+                    ("mobile", f"https://{host}/gp/aw/d/{asin}{suffix}")):
+        try:
+            page = fetch(u)
+            status = detect_amazon(page, seller)
+            if status != "unknown":
+                return status, page
+            print(f"  captcha ({kind})")
+        except FetchError as e:
+            print(f"  HTTP {e.code} ({kind})")
+        except Exception as e:  # noqa: BLE001
+            print(f"  error ({kind}): {e}")
+        time.sleep(random.uniform(4, 8))
     return "unknown", ""
 
 
@@ -300,7 +335,7 @@ def check(product):
             return status, ""
         page = fetch(url)
         return detect_generic(page, product), page
-    except urllib.error.HTTPError as e:
+    except FetchError as e:
         print(f"  HTTP {e.code}")
         return "unknown", ""
     except Exception as e:  # noqa: BLE001
@@ -480,7 +515,8 @@ def run_checks(products, state):
             send(msg_out(n, p))
             st["since"] = None
         st["status"] = status
-        time.sleep(2)
+        # pause between products like a person browsing (longer on the computer, where there's time)
+        time.sleep(random.uniform(8, 16) if LOOP_MODE else 2)
 
 
 def keepalive(state):
@@ -528,8 +564,9 @@ def main_loop():
         return 3
     state = load(STATE_FILE, {})
     CHAT_ID = CHAT_ID or state.get("chat_id", "")
-    print(f"MyRupeeBot running - checks every {CHECK_MINUTES:g} min. Close this window to stop.")
+    print(f"MyRupeeBot running - checks about every {CHECK_MINUTES:g} min ({ENGINE} mode). Close this window to stop.")
     last_check = 0.0
+    wait = 0.0
     while True:
         try:
             products = load(PRODUCTS_FILE, [])
@@ -537,9 +574,10 @@ def main_loop():
             check_now = process_updates(get_updates(state, 25), products, state)
             save(PRODUCTS_FILE, products)
             save(STATE_FILE, state)
-            if check_now or time.time() - last_check >= CHECK_MINUTES * 60:
+            if check_now or time.time() - last_check >= wait:
                 run_checks(products, state)
                 last_check = time.time()
+                wait = CHECK_MINUTES * 60 * random.uniform(0.8, 1.3)   # not a robotic fixed rhythm
                 save(PRODUCTS_FILE, products)
                 save(STATE_FILE, state)
         except KeyboardInterrupt:

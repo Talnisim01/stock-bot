@@ -12,6 +12,10 @@ if not defined PY (
   pause
   exit /b
 )
+%PY% -c "import curl_cffi" >nul 2>nul || (
+  echo Installing browser engine - one time only...
+  %PY% -m pip install --disable-pip-version-check -q curl_cffi
+)
 :run
 %PY% bot.py --loop
 if errorlevel 3 if not errorlevel 4 (pause & exit /b)
