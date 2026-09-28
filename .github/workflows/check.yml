@@ -18,6 +18,8 @@ jobs:
     timeout-minutes: 8
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
 
       - name: Run bot
         env:
