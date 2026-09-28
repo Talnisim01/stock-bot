@@ -100,6 +100,12 @@ def fetch(url):
         "Accept": "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9,he;q=0.8",
         "Accept-Encoding": "gzip, deflate",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Cache-Control": "max-age=0",
     })
     with urllib.request.urlopen(req, timeout=25) as r:
         raw = r.read()
@@ -183,12 +189,33 @@ def detect_generic(page, product):
     return "unknown"
 
 
+def check_amazon(url):
+    """Amazon often answers 503 to servers; try the desktop and mobile pages a few times."""
+    urls = [url]
+    m = re.search(r"/dp/([A-Z0-9]{10})", url)
+    if m:
+        host = urllib.parse.urlparse(url).netloc
+        urls.append(f"https://{host}/gp/aw/d/{m.group(1)}")
+    for attempt in range(3):
+        for u in urls:
+            try:
+                page = fetch(u)
+                status = detect_amazon(page)
+                if status != "unknown":
+                    return status, page
+            except urllib.error.HTTPError as e:
+                print(f"  HTTP {e.code} ({'mobile' if '/gp/aw/' in u else 'desktop'})")
+            except Exception as e:  # noqa: BLE001
+                print(f"  error: {e}")
+            time.sleep(3 + attempt * 4)
+    return "unknown", ""
+
+
 def check(product):
     url = product["url"]
     try:
         if "amazon." in urllib.parse.urlparse(url).netloc:
-            page = fetch(url)
-            return detect_amazon(page), page
+            return check_amazon(url)
         status = detect_shopify(url)
         if status != "unknown":
             return status, ""
