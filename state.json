@@ -2,8 +2,10 @@
   "items": {
     "https://www.amazon.in/dp/B093QF35KZ": {
       "status": "unknown",
-      "fails": 2
+      "fails": 3
     }
   },
-  "keepalive": "2026-09-28"
+  "keepalive": "2026-09-28",
+  "last_update_id": 438667745,
+  "chat_id": "-5319088944"
 }
