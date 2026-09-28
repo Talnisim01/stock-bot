@@ -73,6 +73,13 @@ MENU = {"keyboard": [[BTN_AVAILABLE, BTN_ALL], [BTN_CHECK, BTN_HELP]], "resize_k
 
 LOOP_MODE = "--loop" in sys.argv
 
+# Windows consoles can't always print Hebrew/emoji — never crash on that.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:  # noqa: BLE001
+        pass
+
 
 # ---------- small helpers ----------
 
@@ -508,23 +515,38 @@ def main_once():
 def main_loop():
     global CHAT_ID
     if not TOKEN:
-        print("חסר טוקן: צרו קובץ config.json עם TELEGRAM_TOKEN (ראו README).")
+        print("Missing token: put TELEGRAM_TOKEN in config.json next to bot.py.")
         return 1
+    # Only one copy may run (two copies would double every alert).
+    import socket
+    global _LOCK
+    _LOCK = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        _LOCK.bind(("127.0.0.1", 47831))
+    except OSError:
+        print("The bot is already running in another window.")
+        return 3
     state = load(STATE_FILE, {})
     CHAT_ID = CHAT_ID or state.get("chat_id", "")
-    print(f"MyRupeeBot running — checks every {CHECK_MINUTES:g} min. Ctrl+C to stop.")
+    print(f"MyRupeeBot running - checks every {CHECK_MINUTES:g} min. Close this window to stop.")
     last_check = 0.0
     while True:
-        products = load(PRODUCTS_FILE, [])
-        state = load(STATE_FILE, {})
-        check_now = process_updates(get_updates(state, 25), products, state)
-        save(PRODUCTS_FILE, products)
-        save(STATE_FILE, state)
-        if check_now or time.time() - last_check >= CHECK_MINUTES * 60:
-            run_checks(products, state)
-            last_check = time.time()
+        try:
+            products = load(PRODUCTS_FILE, [])
+            state = load(STATE_FILE, {})
+            check_now = process_updates(get_updates(state, 25), products, state)
             save(PRODUCTS_FILE, products)
             save(STATE_FILE, state)
+            if check_now or time.time() - last_check >= CHECK_MINUTES * 60:
+                run_checks(products, state)
+                last_check = time.time()
+                save(PRODUCTS_FILE, products)
+                save(STATE_FILE, state)
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:  # noqa: BLE001  (no internet after sleep, etc.) — wait and carry on
+            print(f"[{hhmmss()}] error: {e} - retrying in 30s")
+            time.sleep(30)
 
 
 if __name__ == "__main__":
