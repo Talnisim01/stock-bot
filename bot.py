@@ -75,6 +75,13 @@ def tg(method, **params):
     try:
         with urllib.request.urlopen(url, data=data, timeout=20) as r:
             return json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")
+        print(f"telegram {method} failed: HTTP {e.code} {body}")
+        try:
+            return json.loads(body)
+        except json.JSONDecodeError:
+            return {}
     except Exception as e:  # noqa: BLE001
         print(f"telegram {method} failed: {e}")
         return {}
@@ -202,7 +209,12 @@ STATUS_HE = {"in": "✅ במלאי", "out": "❌ אזל", "unknown": "❔ לא �
 
 def handle_commands(products, state):
     global CHAT_ID
+    print(f"token set: {'yes' if TOKEN else 'NO'} | chat: {CHAT_ID or 'not linked yet'}")
+    me = tg("getMe")
+    if me:
+        print(f"bot: @{me.get('result', {}).get('username')} ok={me.get('ok')}")
     upd = tg("getUpdates", offset=state.get("last_update_id", 0) + 1, timeout=0)
+    print(f"getUpdates ok={upd.get('ok')} messages={len(upd.get('result', []))} {upd.get('description', '')}")
     changed = False
     for u in upd.get("result", []):
         state["last_update_id"] = u["update_id"]
