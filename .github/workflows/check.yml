@@ -32,5 +32,6 @@ jobs:
             git config user.email "stock-bot@users.noreply.github.com"
             git add products.json state.json
             git commit -m "update stock state"
-            git push
+            git pull --rebase -X theirs origin main
+            git push origin HEAD:main
           fi
