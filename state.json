@@ -1,11 +1,20 @@
 {
   "items": {
     "https://www.amazon.in/dp/B093QF35KZ": {
-      "status": "unknown",
+      "status": "out",
       "fails": 3
+    },
+    "https://www.amazon.in/dp/B07K6RYVJ5": {
+      "status": "out"
+    },
+    "https://www.amazon.in/dp/B0C1H3K2V4": {
+      "status": "out"
+    },
+    "https://www.amazon.in/dp/B093QF35KZ?smid=A1G3PUPKCIO8DY&psc=1": {
+      "status": "out"
     }
   },
   "keepalive": "2026-09-28",
-  "last_update_id": 438667745,
+  "last_update_id": 438667747,
   "chat_id": "-5319088944"
 }
