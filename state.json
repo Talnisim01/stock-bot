@@ -1,0 +1,9 @@
+{
+  "items": {
+    "https://www.amazon.in/dp/B093QF35KZ": {
+      "status": "unknown",
+      "fails": 1
+    }
+  },
+  "keepalive": "2026-09-28"
+}
