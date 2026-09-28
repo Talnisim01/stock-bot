@@ -1,8 +1,10 @@
 name: Stock check
 
 on:
-  schedule:
-    - cron: "*/15 * * * *"   # every 15 minutes (GitHub may delay a few minutes)
+  # Turned off: the bot now runs on Tal's computer (start_bot.bat).
+  # To move back to GitHub, remove the # from the two lines below.
+  # schedule:
+  #   - cron: "*/15 * * * *"
   workflow_dispatch:          # "Run workflow" button for a manual run
 
 permissions:
