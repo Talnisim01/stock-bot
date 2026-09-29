@@ -72,7 +72,37 @@ BTN_AVAILABLE = "🛒 מה זמין עכשיו?"
 BTN_ALL = "📋 כל המוצרים"
 BTN_CHECK = "🔄 בדוק עכשיו"
 BTN_HELP = "📖 הוראות שימוש"
-MENU = {"keyboard": [[BTN_AVAILABLE, BTN_ALL], [BTN_CHECK, BTN_HELP]], "resize_keyboard": True}
+BTN_NEW = "🆕 מה חדש"
+MENU = {"keyboard": [[BTN_AVAILABLE, BTN_ALL], [BTN_CHECK, BTN_HELP], [BTN_NEW]], "resize_keyboard": True}
+
+# ---------- version & what's new ----------
+# When changing the bot: raise VERSION and add a block at the TOP of CHANGELOG.
+VERSION = "1.3"
+CHANGELOG = [
+    ("1.3", "29/09/2026", [
+        "⚡ בדיקות מהירות פי 3: כל מוצר נבדק בערך כל דקה וחצי",
+        "🐢 אם אמזון חוסמת, הבוט מאט לבד וחוזר למהירות כשזה נרגע",
+        "🧹 כשמוצר אוזל, הודעת ה־🚨 הופכת לשורת \"המלאי אזל\" והכפתור נעלם",
+        "✅ \"אזל\" מוכרז רק אחרי 2 בדיקות ברצף, כדי לא להכריז מוקדם מדי",
+        "🆕 כפתור \"מה חדש\" ופקודת /update",
+    ]),
+    ("1.2", "28/09/2026", [
+        "🌐 הבוט נראה לאמזון כמו דפדפן Chrome אמיתי, פחות חסימות",
+        "🚦 פחות ניסיונות חוזרים וקצב בדיקה אנושי",
+    ]),
+    ("1.1", "28/09/2026", [
+        "💻 הבוט עבר לרוץ מהמחשב, עונה לכפתורים מיד",
+        "🚨 הודעות בסגנון חדש: ID, מחיר, שעה וכפתור מעבר לרכישה",
+        "📋 תפריט כפתורים ומעקב אחרי מוכר מסוים",
+    ]),
+]
+
+
+def msg_changelog(count=1):
+    parts = []
+    for ver, date, lines in CHANGELOG[:count]:
+        parts.append(f"🆕 <b>מה חדש בגרסה {ver}</b> ({date})\n\n" + "\n".join(lines))
+    return "\n\n".join(parts)
 
 LOOP_MODE = "--loop" in sys.argv
 
@@ -408,7 +438,8 @@ HELP = ("📖 <b>הוראות שימוש</b>\n\n"
         "/add קישור [שם] — הוספת מוצר\n"
         "/remove מספר — הסרת מוצר (המספר מהרשימה)\n"
         "/list — כל המוצרים והסטטוס\n"
-        "/menu — הצגת התפריט\n\n"
+        "/menu — הצגת התפריט\n"
+        "/update — מה חדש בגרסה האחרונה\n\n"
         "💡 קישור אמזון עם מוכר מסוים (smid=) יתריע רק כשהמוכר הזה מוכר.")
 
 
@@ -440,7 +471,7 @@ def process_updates(upd, products, state):
         chat = str(msg.get("chat", {}).get("id", ""))
         if not text:
             continue
-        is_button = text in (BTN_AVAILABLE, BTN_ALL, BTN_CHECK, BTN_HELP)
+        is_button = text in (BTN_AVAILABLE, BTN_ALL, BTN_CHECK, BTN_HELP, BTN_NEW)
         if not text.startswith("/") and not is_button:
             continue
         # First command ever: the chat it came from becomes the bot's home chat.
@@ -493,6 +524,9 @@ def process_updates(upd, products, state):
 
         elif cmd in ("/help", "/start", "/menu") or text == BTN_HELP:
             send(HELP, chat, menu=True)
+
+        elif cmd in ("/update", "/whatsnew", "/version") or text == BTN_NEW:
+            send(msg_changelog(3 if len(parts) > 1 and parts[1] == "all" else 1), chat, menu=True)
     return check_now
 
 
@@ -603,7 +637,11 @@ def main_loop():
         return 3
     state = load(STATE_FILE, {})
     CHAT_ID = CHAT_ID or state.get("chat_id", "")
-    print(f"MyRupeeBot running - each product checked about every {CHECK_SECONDS:g}s ({ENGINE} mode). Close this window to stop.")
+    if CHAT_ID and state.get("announced_version") != VERSION:
+        send(msg_changelog(1), menu=True)
+        state["announced_version"] = VERSION
+        save(STATE_FILE, state)
+    print(f"MyRupeeBot v{VERSION} running - each product checked about every {CHECK_SECONDS:g}s ({ENGINE} mode). Close this window to stop.")
     slow = 1.0            # grows when Amazon blocks, shrinks back when it's quiet
     turn = 0              # which product is next
     next_at = 0.0         # when the next Amazon request may go out
