@@ -207,7 +207,7 @@ except Exception:  # noqa: BLE001
     ENGINE = "basic"
 
 _WARMED = set()
-BLOCKS = {"count": 0}
+BLOCKS = {"count": 0, "soft": 0}   # hard = 503/429/403, soft = captcha page
 
 
 def _note_block(code):
@@ -335,6 +335,7 @@ def check_amazon(url):
             if status != "unknown":
                 return status, page
             print(f"  captcha ({kind})")
+            BLOCKS["soft"] += 1
         except FetchError as e:
             print(f"  HTTP {e.code} ({kind})")
         except Exception as e:  # noqa: BLE001
@@ -657,11 +658,14 @@ def main_loop():
             elif products and time.time() >= next_at:
                 turn %= len(products)
                 p = products[turn]
-                before = BLOCKS["count"]
+                hard, soft = BLOCKS["count"], BLOCKS["soft"]
                 check_one(turn + 1, p, state.setdefault("items", {}).setdefault(p["url"], {"status": "unknown"}))
-                if BLOCKS["count"] > before:
-                    slow = min(slow * 1.5, 6)          # Amazon pushed back: ease off (up to ~9 min per product)
+                if BLOCKS["count"] > hard:
+                    slow = min(slow * 1.5, 6)          # Amazon pushed back hard: ease off (up to ~9 min per product)
                     print(f"  Amazon blocked - slowing down x{slow:.1f}")
+                elif BLOCKS["soft"] > soft:
+                    slow = min(slow * 1.2, 6)          # captcha: ease off a little
+                    print(f"  Amazon captcha - slowing down x{slow:.1f}")
                 elif slow > 1:
                     slow = max(1.0, slow / 1.15)       # quiet again: speed back up gradually
                 turn += 1
