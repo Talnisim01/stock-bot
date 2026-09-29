@@ -12,9 +12,9 @@ if not defined PY (
   pause
   exit /b
 )
-%PY% -c "import curl_cffi" >nul 2>nul || (
+%PY% -c "import curl_cffi, tzdata" >nul 2>nul || (
   echo Installing browser engine - one time only...
-  %PY% -m pip install --disable-pip-version-check -q curl_cffi
+  %PY% -m pip install --disable-pip-version-check --no-warn-script-location -q curl_cffi tzdata
 )
 :run
 %PY% bot.py --loop

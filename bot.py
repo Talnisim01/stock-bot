@@ -6,10 +6,13 @@ Two ways to run:
   python3 bot.py          one check cycle (used by GitHub Actions every 15 minutes)
   python3 bot.py --loop   runs non-stop on your computer: instant replies, each product every ~CHECK_SECONDS (adaptive)
 
-Standard library only, nothing to install.
-The token comes from the TELEGRAM_TOKEN environment variable or from config.json next to this file.
+Cloud backup: the computer saves its state + a heartbeat to the 'live' branch on GitHub.
+When the computer is silent for a while (asleep/off), GitHub Actions takes over until it's back.
+
+Tokens come from environment variables or from config.json next to this file.
 """
 
+import base64
 import gzip
 import html as htmlmod
 import json
@@ -48,6 +51,17 @@ CHECK_SECONDS = float(os.environ.get("CHECK_SECONDS") or CONFIG.get("CHECK_SECON
 BLOCKED_WARN_HOURS = 3      # warn in the group after this long without a successful check
 KEEPALIVE_DAYS = 20
 
+# Cloud backup (GitHub). On the computer the token comes from config.json; on GitHub it's built in.
+_gh = (os.environ.get("GITHUB_TOKEN") or CONFIG.get("GITHUB_TOKEN", "")).strip()
+GITHUB_TOKEN = "" if (not _gh or "PASTE" in _gh.upper()) else _gh
+GITHUB_REPO = os.environ.get("GITHUB_REPOSITORY") or CONFIG.get("GITHUB_REPO", "Talnisim01/stock-bot")
+GITHUB_API = "https://api.github.com"
+STORE_BRANCH = "live"
+STORE_PATH = "live.json"
+PC_TIMEOUT = 25 * 60        # cloud takes over when the computer has been silent this long
+HEARTBEAT_EVERY = 10 * 60   # the computer reports "I'm alive" at least this often
+ADMINS = [str(a) for a in CONFIG.get("ADMINS", [])]   # optional extra admins (Telegram user ids)
+
 try:
     from zoneinfo import ZoneInfo
     TZ = ZoneInfo("Asia/Jerusalem")
@@ -73,12 +87,25 @@ BTN_ALL = "📋 כל המוצרים"
 BTN_CHECK = "🔄 בדוק עכשיו"
 BTN_HELP = "📖 הוראות שימוש"
 BTN_NEW = "🆕 מה חדש"
-MENU = {"keyboard": [[BTN_AVAILABLE, BTN_ALL], [BTN_CHECK, BTN_HELP], [BTN_NEW]], "resize_keyboard": True}
+BTN_STATUS = "ℹ️ סטטוס"
+BTN_STATS = "📊 סטטיסטיקה"
+BUTTONS = (BTN_AVAILABLE, BTN_ALL, BTN_CHECK, BTN_HELP, BTN_NEW, BTN_STATUS, BTN_STATS)
+MENU = {"keyboard": [[BTN_AVAILABLE, BTN_ALL], [BTN_CHECK, BTN_STATUS], [BTN_STATS, BTN_NEW], [BTN_HELP]],
+        "resize_keyboard": True}
 
 # ---------- version & what's new ----------
 # When changing the bot: raise VERSION and add a block at the TOP of CHANGELOG.
-VERSION = "1.3"
+VERSION = "1.4"
 CHANGELOG = [
+    ("1.4", "29/09/2026", [
+        "📊 סטטיסטיקה: כמה פעמים כל מוצר חזר למלאי, כמה זמן החזיק ובאילו שעות",
+        "🔥 בשעות שבהן המלאי בדרך כלל חוזר, הבוט בודק מהר יותר (ובלילה לאט יותר)",
+        "ℹ️ כפתור סטטוס: מאיפה הבוט רץ, מתי הבדיקה האחרונה ומה הקצב",
+        "☁️ גיבוי בענן: כשהמחשב כבוי או ישן, הבוט ממשיך לבדוק מ־GitHub",
+        "💻 הודעה כשהבוט חוזר לפעול אחרי הפסקה",
+        "⏱ בהודעת האזילה מופיע כמה זמן המוצר היה במלאי",
+        "🔒 רק מנהלי הקבוצה יכולים להוסיף או להסיר מוצרים",
+    ]),
     ("1.3", "29/09/2026", [
         "⚡ בדיקות מהירות פי 3: כל מוצר נבדק בערך כל דקה וחצי",
         "🐢 אם אמזון חוסמת, הבוט מאט לבד וחוזר למהירות כשזה נרגע",
@@ -126,6 +153,67 @@ def hhmmss(ts=None):
 
 def esc(text):
     return htmlmod.escape(str(text))
+
+
+def when(ts):
+    """08:35:12, or 28/09 08:35 when it's not today."""
+    if not ts:
+        return "—"
+    d = datetime.fromtimestamp(ts, TZ)
+    return d.strftime("%H:%M:%S") if d.date() == now().date() else d.strftime("%d/%m %H:%M")
+
+
+def fmt_dur(sec):
+    sec = int(max(0, sec))
+    if sec < 60:
+        return "פחות מדקה"
+    m = sec // 60
+    if m < 60:
+        return f"{m} דק'"
+    h, m = divmod(m, 60)
+    if h < 24:
+        return f"{h} ש'" + (f" ו־{m} דק'" if m else "")
+    d, h = divmod(h, 24)
+    return ("יום" if d == 1 else f"{d} ימים") + (f" ו־{h} ש'" if h else "")
+
+
+# ---------- stock history (for /stats and the hot-hours speed) ----------
+
+def ev_open(state, url, ts):
+    ev = state.setdefault("events", [])
+    ev.append({"u": url, "in": ts, "out": None})
+    del ev[:-400]
+
+
+def ev_close(state, url, ts):
+    for e in reversed(state.get("events", [])):
+        if e["u"] == url and e["out"] is None:
+            e["out"] = ts
+            return
+
+
+def hour_counts(state, days=21):
+    since = time.time() - days * 86400
+    counts = [0] * 24
+    for e in state.get("events", []):
+        if e["in"] >= since:
+            counts[datetime.fromtimestamp(e["in"], TZ).hour] += 1
+    return counts
+
+
+def hour_factor(state):
+    """Speed multiplier for the current hour: <1 = faster (restocks happen now), >1 = slower (quiet)."""
+    c = hour_counts(state)
+    h = now().hour
+    if not sum(c):
+        return 1.0, ""
+    if c[h]:
+        return 0.5, "🔥 שעה חמה"
+    if c[(h - 1) % 24] or c[(h + 1) % 24]:
+        return 0.75, "♨️ ליד שעה חמה"
+    if sum(c) >= 10 and 1 <= h <= 5:
+        return 1.5, "🌙 שעה שקטה"
+    return 1.0, ""
 
 
 def load(path, default):
@@ -188,6 +276,66 @@ def edit(message_id, text):
     return bool(r.get("ok"))
 
 
+# ---------- cloud store (GitHub 'live' branch) ----------
+
+_STORE_SHA = {}
+
+
+def _gh(method, path, body=None):
+    req = urllib.request.Request(
+        f"{GITHUB_API}/repos/{GITHUB_REPO}/{path}", method=method,
+        data=json.dumps(body).encode() if body is not None else None,
+        headers={"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github+json",
+                 "User-Agent": "MyRupeeBot", "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return r.status, json.loads(r.read().decode() or "{}")
+    except urllib.error.HTTPError as e:
+        return e.code, {}
+
+
+def store_get(path=STORE_PATH, branch=STORE_BRANCH):
+    """Read a JSON file from GitHub. None if missing/unavailable."""
+    if not GITHUB_TOKEN:
+        return None
+    try:
+        code, data = _gh("GET", f"contents/{path}?ref={branch}")
+    except Exception as e:  # noqa: BLE001
+        print(f"cloud read failed: {e}")
+        return None
+    if code != 200:
+        if code != 404:
+            print(f"cloud read failed: HTTP {code}")
+        return None
+    _STORE_SHA[(path, branch)] = data.get("sha")
+    try:
+        return json.loads(base64.b64decode(data["content"]).decode("utf-8"))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def store_put(doc, who, path=STORE_PATH, branch=STORE_BRANCH):
+    """Write a JSON file to GitHub. Returns 'ok', 'conflict' or 'error'."""
+    if not GITHUB_TOKEN:
+        return "error"
+    body = {"message": f"state ({who})", "branch": branch,
+            "content": base64.b64encode(json.dumps(doc, ensure_ascii=False).encode("utf-8")).decode()}
+    if _STORE_SHA.get((path, branch)):
+        body["sha"] = _STORE_SHA[(path, branch)]
+    try:
+        code, data = _gh("PUT", f"contents/{path}", body)
+    except Exception as e:  # noqa: BLE001
+        print(f"cloud save failed: {e}")
+        return "error"
+    if code in (200, 201):
+        _STORE_SHA[(path, branch)] = (data.get("content") or {}).get("sha")
+        return "ok"
+    if code in (409, 422):
+        return "conflict"
+    print(f"cloud save failed: HTTP {code}")
+    return "error"
+
+
 # ---------- fetching ----------
 
 class FetchError(Exception):
@@ -208,6 +356,7 @@ except Exception:  # noqa: BLE001
 
 _WARMED = set()
 BLOCKS = {"count": 0, "soft": 0}   # hard = 503/429/403, soft = captcha page
+RUNTIME = {"captchas": [], "slow": 1.0, "started": time.time()}
 
 
 def _note_block(code):
@@ -336,6 +485,7 @@ def check_amazon(url):
                 return status, page
             print(f"  captcha ({kind})")
             BLOCKS["soft"] += 1
+            RUNTIME["captchas"] = [t for t in RUNTIME["captchas"] if t > time.time() - 3600] + [time.time()]
         except FetchError as e:
             print(f"  HTTP {e.code} ({kind})")
         except Exception as e:  # noqa: BLE001
@@ -415,8 +565,57 @@ def msg_in_stock(n, p, st):
             f"🕐 זמין משעה: {hhmmss(st.get('since'))}")
 
 
-def msg_out(n, p):
-    return f"{esc(label(p))} - המלאי אזל. {hhmmss()} - ID {n}"
+def msg_out(n, p, since=None):
+    lasted = f"\n⏱ היה במלאי {fmt_dur(time.time() - since)}" if since else ""
+    return f"{esc(label(p))} - המלאי אזל. {hhmmss()} - ID {n}{lasted}"
+
+
+def msg_stats(products, state):
+    since = time.time() - 30 * 86400
+    events = [e for e in state.get("events", []) if e["in"] >= since]
+    if not events:
+        return ("📊 <b>סטטיסטיקה</b>\n\nעוד אין נתונים. כל פעם שמוצר חוזר למלאי זה נרשם, "
+                "ואחרי כמה חזרות יופיעו כאן השעות החמות.")
+    lines = []
+    for n, p in enumerate(products, 1):
+        ev = [e for e in events if e["u"] == p["url"]]
+        if not ev:
+            lines.append(f"{n}. {esc(label(p))}\n    לא חזר למלאי ב־30 הימים האחרונים")
+            continue
+        closed = [e["out"] - e["in"] for e in ev if e["out"]]
+        avg = f" · החזיק בממוצע {fmt_dur(sum(closed) / len(closed))}" if closed else ""
+        times = "חזרה אחת" if len(ev) == 1 else f"{len(ev)} חזרות"
+        lines.append(f"{n}. {esc(label(p))}\n    {times}{avg} · אחרונה: {when(ev[-1]['in'])}")
+    c = hour_counts(state, 30)
+    top = sorted(((v, h) for h, v in enumerate(c) if v), reverse=True)[:3]
+    hot = " · ".join(f"{h:02d}:00–{(h + 1) % 24:02d}:00 ({v})" for v, h in top)
+    return ("📊 <b>סטטיסטיקה — 30 הימים האחרונים</b>\n\n" + "\n".join(lines) +
+            f"\n\n🔥 <b>שעות חמות:</b> {hot}")
+
+
+def msg_status(products, state):
+    items = state.get("items", {})
+    in_now = sum(1 for p in products if items.get(p["url"], {}).get("status") == "in")
+    if LOOP_MODE:
+        hf, tag = hour_factor(state)
+        per = CHECK_SECONDS * RUNTIME["slow"] * hf
+        where = "💻 המחשב"
+        speed = f"כל מוצר נבדק כל ~{int(per)} שניות" + (f" ({tag})" if tag else "")
+        if RUNTIME["slow"] > 1.05:
+            speed += f"\n🐢 מואט פי {RUNTIME['slow']:.1f} בגלל חסימות של אמזון"
+        caps = sum(1 for t in RUNTIME["captchas"] if t > time.time() - 3600)
+        extra = f"\n🧩 captcha בשעה האחרונה: {caps}"
+    else:
+        where = "☁️ הענן (גיבוי — המחשב לא זמין)"
+        speed = "כל המוצרים נבדקים כל ~15 דקות"
+        extra = f"\n💻 המחשב נראה לאחרונה: {when(state.get('pc_heartbeat'))}"
+    backup = "פעיל ✅" if state.get("backup_enabled") else "לא מוגדר"
+    return (f"ℹ️ <b>סטטוס הבוט</b> · גרסה {VERSION}\n\n"
+            f"📍 רץ מ: {where}\n"
+            f"🕐 בדיקה אחרונה: {when(state.get('last_ok'))}\n"
+            f"⚡ {speed}{extra}\n"
+            f"☁️ גיבוי בענן: {backup}\n"
+            f"📦 מוצרים: {len(products)} ({in_now} במלאי עכשיו)")
 
 
 def msg_list(products, items, only_in=False):
@@ -436,9 +635,11 @@ def msg_list(products, items, only_in=False):
 HELP = ("📖 <b>הוראות שימוש</b>\n\n"
         "הבוט בודק את כל המוצרים אוטומטית, ושולח הודעה כשמוצר חוזר למלאי וכשהוא אוזל.\n\n"
         "<b>פקודות:</b>\n"
-        "/add קישור [שם] — הוספת מוצר\n"
-        "/remove מספר — הסרת מוצר (המספר מהרשימה)\n"
+        "/add קישור [שם] — הוספת מוצר (מנהלים בלבד)\n"
+        "/remove מספר — הסרת מוצר (מנהלים בלבד)\n"
         "/list — כל המוצרים והסטטוס\n"
+        "/status — מצב הבוט\n"
+        "/stats — סטטיסטיקת מלאי ושעות חמות\n"
         "/menu — הצגת התפריט\n"
         "/update — מה חדש בגרסה האחרונה\n\n"
         "💡 קישור אמזון עם מוכר מסוים (smid=) יתריע רק כשהמוכר הזה מוכר.")
@@ -461,6 +662,27 @@ def get_updates(state, poll_timeout):
     return {}
 
 
+_ADMIN_CACHE = {}
+
+
+def is_admin(chat, msg):
+    """Group creator/admins (and anonymous admins) may add/remove products."""
+    if str((msg.get("sender_chat") or {}).get("id", "")) == str(chat):
+        return True
+    uid = str((msg.get("from") or {}).get("id", ""))
+    if not uid:
+        return False
+    if uid in ADMINS:
+        return True
+    hit = _ADMIN_CACHE.get(uid)
+    if hit and hit[1] > time.time() - 600:
+        return hit[0]
+    r = tg("getChatMember", chat_id=chat, user_id=uid)
+    ok = (r.get("result") or {}).get("status") in ("creator", "administrator")
+    _ADMIN_CACHE[uid] = (ok, time.time())
+    return ok
+
+
 def process_updates(upd, products, state):
     global CHAT_ID
     items = state.setdefault("items", {})
@@ -472,7 +694,7 @@ def process_updates(upd, products, state):
         chat = str(msg.get("chat", {}).get("id", ""))
         if not text:
             continue
-        is_button = text in (BTN_AVAILABLE, BTN_ALL, BTN_CHECK, BTN_HELP, BTN_NEW)
+        is_button = text in BUTTONS
         if not text.startswith("/") and not is_button:
             continue
         # First command ever: the chat it came from becomes the bot's home chat.
@@ -485,6 +707,10 @@ def process_updates(upd, products, state):
 
         parts = text.split(maxsplit=2)
         cmd = parts[0].split("@")[0].lower()
+
+        if cmd in ("/add", "/remove") and not is_admin(chat, msg):
+            send("🔒 רק מנהלי הקבוצה יכולים להוסיף או להסיר מוצרים.", chat)
+            continue
 
         if cmd == "/add" and len(parts) >= 2:
             url = clean_url(parts[1])
@@ -526,6 +752,12 @@ def process_updates(upd, products, state):
         elif cmd in ("/help", "/start", "/menu") or text == BTN_HELP:
             send(HELP, chat, menu=True)
 
+        elif cmd == "/status" or text == BTN_STATUS:
+            send(msg_status(products, state), chat)
+
+        elif cmd == "/stats" or text == BTN_STATS:
+            send(msg_stats(products, state), chat)
+
         elif cmd in ("/update", "/whatsnew", "/version") or text == BTN_NEW:
             send(msg_changelog(3 if len(parts) > 1 and parts[1] == "all" else 1), chat, menu=True)
     return check_now
@@ -536,7 +768,7 @@ def process_updates(upd, products, state):
 OUT_CONFIRM = 2   # "sold out" needs 2 reads in a row (a single odd page must not kill a live alert)
 
 
-def check_one(n, p, st):
+def check_one(n, p, st, state):
     """Check one product, send/edit messages. Returns the status that was read."""
     url = p["url"]
     print(f"[{hhmmss()}] checking {n}. {label(p)}")
@@ -554,6 +786,7 @@ def check_one(n, p, st):
             send(f"⚠️ לא מצליח לבדוק כבר {int(hours)} שעות:\nID {n} — {esc(label(p))}{where}")
         return status
 
+    state["last_ok"] = time.time()
     if st.get("warned"):
         send(f"✅ הבדיקות חזרו לעבוד: ID {n} — {esc(label(p))}")
     st.pop("fail_since", None)
@@ -567,6 +800,7 @@ def check_one(n, p, st):
             st["since"] = time.time()
             if prev == "out":
                 st["msg_id"] = send(msg_in_stock(n, p, st), buy_url=url)
+                ev_open(state, url, st["since"])
         st["status"] = "in"
     elif status == "out":
         if prev == "in":
@@ -575,9 +809,10 @@ def check_one(n, p, st):
                 print("  (waiting for a second 'out' before announcing)")
                 return status
             # The alert message turns into the sold-out line, so the chat stays clean.
-            text = msg_out(n, p)
+            text = msg_out(n, p, st.get("since"))
             if not (st.get("msg_id") and edit(st["msg_id"], text)):
                 send(text)
+            ev_close(state, url, time.time())
         st["status"] = "out"
         st["out_reads"] = 0
         st["since"] = None
@@ -589,7 +824,7 @@ def run_checks(products, state):
     """Check every product once (GitHub mode, and the 'check now' button)."""
     items = state.setdefault("items", {})
     for n, p in enumerate(products, 1):
-        check_one(n, p, items.setdefault(p["url"], {"status": "unknown"}))
+        check_one(n, p, items.setdefault(p["url"], {"status": "unknown"}), state)
         time.sleep(random.uniform(6, 12) if LOOP_MODE else 2)
 
 
@@ -602,24 +837,91 @@ def keepalive(state):
 
 # ---------- main ----------
 
+def cloud_keepalive():
+    """GitHub pauses schedules after ~60 quiet days on the main branch; touch it every ~20 days."""
+    k = store_get(".keepalive", "main") or {}
+    try:
+        last = datetime.fromisoformat(k.get("date", "2000-01-01")).date()
+    except ValueError:
+        last = datetime(2000, 1, 1).date()
+    if (now().date() - last).days >= KEEPALIVE_DAYS:
+        store_put({"date": now().date().isoformat()}, "keepalive", ".keepalive", "main")
+
+
 def main_once():
+    """GitHub Actions run. With cloud backup: acts only while the computer is silent."""
     global CHAT_ID
+    if GITHUB_TOKEN and os.environ.get("GITHUB_ACTIONS"):
+        doc = store_get()
+        if not doc or not doc.get("state", {}).get("backup_enabled"):
+            print("cloud backup not set up yet (no state from the computer) - nothing to do")
+            return
+        products, state = doc["products"], doc["state"]
+        silent = time.time() - state.get("pc_heartbeat", 0)
+        if silent < PC_TIMEOUT:
+            print(f"computer is active (last seen {int(silent)}s ago) - cloud stays idle")
+            cloud_keepalive()
+            return
+        CHAT_ID = CHAT_ID or state.get("chat_id", "")
+        print(f"computer silent for {fmt_dur(silent)} - cloud takes over")
+        if not state.get("cloud_active"):
+            state["cloud_active"] = True
+            send(f"☁️ המחשב לא זמין מאז {when(state.get('pc_heartbeat'))}.\n"
+                 f"הגיבוי בענן ממשיך לבדוק כל ~15 דקות, ופקודות ייענו באיחור של עד 15 דקות.")
+        process_updates(get_updates(state, 0), products, state)
+        run_checks(products, state)
+        state["saved_at"] = time.time()
+        state["updated_by"] = "cloud"
+        cloud_keepalive()
+        doc.update(products=products, state=state)
+        result = store_put(doc, "cloud")
+        if result == "conflict":
+            print("the computer came back while the cloud was running - leaving it to the computer")
+        return
+
+    # Without cloud backup: plain one-off run on local files.
     products = load(PRODUCTS_FILE, [])
     state = load(STATE_FILE, {})
     CHAT_ID = CHAT_ID or state.get("chat_id", "")
-    before = json.dumps([products, state], sort_keys=True)
-
     print(f"token set: {'yes' if TOKEN else 'NO'} | chat: {CHAT_ID or 'not linked yet'}")
     upd = get_updates(state, 0)
     print(f"telegram messages: {len(upd.get('result', []))}")
     process_updates(upd, products, state)
     run_checks(products, state)
-    keepalive(state)
+    save(PRODUCTS_FILE, products)
+    save(STATE_FILE, state)
 
-    if json.dumps([products, state], sort_keys=True) != before:
-        save(PRODUCTS_FILE, products)
-        save(STATE_FILE, state)
-        print("state changed")
+
+def signature(products, state):
+    """What counts as a real change worth saving to the cloud right away."""
+    items = state.get("items", {})
+    return json.dumps([products, {u: (i.get("status"), i.get("msg_id")) for u, i in items.items()},
+                       len(state.get("events", [])), state.get("last_update_id"), state.get("cloud_active")],
+                      sort_keys=True, ensure_ascii=False)
+
+
+def adopt_cloud(products, state, since=None):
+    """If the cloud saved after `since` (default: our last save), continue from its state."""
+    since = state.get("saved_at", 0) if since is None else since
+    doc = store_get()
+    rs = (doc or {}).get("state", {})
+    if doc and rs.get("updated_by") == "cloud" and rs.get("saved_at", 0) > since:
+        print("continuing from the cloud's newer state")
+        new_state = doc["state"]
+        new_state["pc_heartbeat"] = state.get("pc_heartbeat", new_state.get("pc_heartbeat"))
+        return doc["products"], new_state
+    return products, state
+
+
+def announce_back(state):
+    """Tell the group the computer is back after a break (sleep/off)."""
+    gap = time.time() - state.get("pc_heartbeat", time.time())
+    if state.get("cloud_active") or gap > 20 * 60:
+        text = f"💻 הבוט חזר לפעול מהמחשב (לא היה זמין {fmt_dur(gap)})."
+        if state.get("cloud_active"):
+            text += "\n☁️ בזמן הזה הגיבוי בענן המשיך לבדוק."
+        send(text)
+    state["cloud_active"] = False
 
 
 def main_loop():
@@ -636,22 +938,40 @@ def main_loop():
     except OSError:
         print("The bot is already running in another window.")
         return 3
+
+    products = load(PRODUCTS_FILE, [])
     state = load(STATE_FILE, {})
+    if GITHUB_TOKEN:
+        products, state = adopt_cloud(products, state)
     CHAT_ID = CHAT_ID or state.get("chat_id", "")
-    if CHAT_ID and state.get("announced_version") != VERSION:
-        send(msg_changelog(1), menu=True)
-        state["announced_version"] = VERSION
-        save(STATE_FILE, state)
-    print(f"MyRupeeBot v{VERSION} running - each product checked about every {CHECK_SECONDS:g}s ({ENGINE} mode). Close this window to stop.")
-    slow = 1.0            # grows when Amazon blocks, shrinks back when it's quiet
+    if CHAT_ID:
+        announce_back(state)
+        if state.get("announced_version") != VERSION:
+            send(msg_changelog(1), menu=True)
+            state["announced_version"] = VERSION
+    state["backup_enabled"] = bool(GITHUB_TOKEN)
+    backup = "cloud backup ON" if GITHUB_TOKEN else "cloud backup OFF (no GITHUB_TOKEN in config.json)"
+    print(f"MyRupeeBot v{VERSION} running - each product about every {CHECK_SECONDS:g}s ({ENGINE} mode, {backup}).")
+    print("Close this window to stop.")
+
     turn = 0              # which product is next
     next_at = 0.0         # when the next Amazon request may go out
+    last_push, last_sig = 0.0, ""
+    push_fails = 0
+    last_iter = time.time()
     while True:
         try:
-            products = load(PRODUCTS_FILE, [])
-            state = load(STATE_FILE, {})
             wait = max(1, min(25, int(next_at - time.time())))
-            check_now = process_updates(get_updates(state, wait), products, state)
+            upd = get_updates(state, wait)
+            # Woke up from sleep? (the clock jumped, usually while waiting for messages)
+            # -> first pick up anything the cloud did meanwhile, before saving anything of ours.
+            if time.time() - last_iter > wait + 150:
+                print(f"[{hhmmss()}] woke up after {fmt_dur(time.time() - last_iter)}")
+                if GITHUB_TOKEN:
+                    products, state = adopt_cloud(products, state)
+                announce_back(state)
+                next_at = 0.0
+            check_now = process_updates(upd, products, state)
             if check_now:
                 run_checks(products, state)
                 next_at = time.time() + CHECK_SECONDS / max(1, len(products))
@@ -659,20 +979,51 @@ def main_loop():
                 turn %= len(products)
                 p = products[turn]
                 hard, soft = BLOCKS["count"], BLOCKS["soft"]
-                check_one(turn + 1, p, state.setdefault("items", {}).setdefault(p["url"], {"status": "unknown"}))
+                check_one(turn + 1, p, state.setdefault("items", {}).setdefault(p["url"], {"status": "unknown"}), state)
+                slow = RUNTIME["slow"]
                 if BLOCKS["count"] > hard:
-                    slow = min(slow * 1.5, 6)          # Amazon pushed back hard: ease off (up to ~9 min per product)
+                    slow = min(slow * 1.5, 6)          # Amazon pushed back hard: ease off
                     print(f"  Amazon blocked - slowing down x{slow:.1f}")
                 elif BLOCKS["soft"] > soft:
                     slow = min(slow * 1.2, 6)          # captcha: ease off a little
                     print(f"  Amazon captcha - slowing down x{slow:.1f}")
                 elif slow > 1:
                     slow = max(1.0, slow / 1.15)       # quiet again: speed back up gradually
+                RUNTIME["slow"] = slow
                 turn += 1
-                gap = CHECK_SECONDS * slow / len(products)
+                hf, _ = hour_factor(state)             # faster in hours when restocks happen
+                gap = CHECK_SECONDS * slow * hf / len(products)
                 next_at = time.time() + max(6.0, gap * random.uniform(0.8, 1.2))
+
+            last_iter = time.time()
+            state["pc_heartbeat"] = time.time()
+            state["saved_at"] = time.time()
+            state["updated_by"] = "pc"
             save(PRODUCTS_FILE, products)
             save(STATE_FILE, state)
+
+            # Cloud backup: report in when something changed, and at least every 10 minutes.
+            sig = signature(products, state)
+            if GITHUB_TOKEN and ((sig != last_sig and time.time() - last_push > 30)
+                                 or time.time() - last_push > HEARTBEAT_EVERY):
+                doc = {"products": products, "state": state}
+                result = store_put(doc, "pc")
+                if result == "conflict":                       # the cloud wrote meanwhile
+                    products, state = adopt_cloud(products, state, since=last_push)
+                    announce_back(state)
+                    state["pc_heartbeat"] = state["saved_at"] = time.time()
+                    result = store_put({"products": products, "state": state}, "pc")
+                if result == "ok":
+                    if push_fails >= 5:
+                        send("✅ הגיבוי בענן חזר לעבוד.")
+                    push_fails = 0
+                    last_push, last_sig = time.time(), signature(products, state)
+                else:
+                    push_fails += 1
+                    if push_fails == 5:
+                        send("⚠️ הגיבוי בענן לא מצליח לשמור מהמחשב.\n"
+                             "אם זה נמשך, ייתכן שהטוקן של GitHub פג תוקף. בינתיים הבוט ממשיך לבדוק כרגיל מהמחשב.")
+                    last_push = time.time() - HEARTBEAT_EVERY + 60   # try again in a minute
         except KeyboardInterrupt:
             raise
         except Exception as e:  # noqa: BLE001  (no internet after sleep, etc.) — wait and carry on
