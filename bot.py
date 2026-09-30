@@ -60,7 +60,8 @@ STORE_BRANCH = "live"
 STORE_PATH = "live.json"
 PC_TIMEOUT = 25 * 60        # cloud takes over when the computer has been silent this long
 HEARTBEAT_EVERY = 10 * 60   # the computer reports "I'm alive" at least this often
-ADMINS = [str(a) for a in CONFIG.get("ADMINS", [])]   # optional extra admins (Telegram user ids)
+ADMINS = [str(a) for a in CONFIG.get("ADMINS", [])]
+GROUP_LINK = CONFIG.get("GROUP_LINK", "https://t.me/+Epg20bu0J7ZlZTdk")   # invite link used by /promo   # optional extra admins (Telegram user ids)
 
 try:
     from zoneinfo import ZoneInfo
@@ -253,11 +254,13 @@ def tg(method, timeout=20, **params):
         return {}
 
 
-def send(text, chat_id=None, buy_url=None, menu=False):
+def send(text, chat_id=None, buy_url=None, menu=False, buttons=None):
     """Send a message. Returns its message_id (or None)."""
     params = {"chat_id": chat_id or CHAT_ID, "text": text,
               "parse_mode": "HTML", "disable_web_page_preview": "true"}
-    if buy_url:
+    if buttons:
+        params["reply_markup"] = json.dumps({"inline_keyboard": buttons}, ensure_ascii=False)
+    elif buy_url:
         params["reply_markup"] = json.dumps(
             {"inline_keyboard": [[{"text": "🛒 מעבר לרכישה", "url": buy_url}]]})
     elif menu:
@@ -632,6 +635,27 @@ def msg_list(products, items, only_in=False):
     return ("📋 <b>מוצרים במעקב:</b>\n\n" + "\n".join(lines)) if lines else "הרשימה ריקה. הוסיפו מוצר עם /add ואחריו קישור."
 
 
+PROMO = ("🚨 <b>הודעה רשמית מהנהלת הבוט</b> 🚨\n\n"
+         "בזמן שאחרים מוכרים לכם מדליות ארד, כסף וזהב 🥉🥈🥇\n"
+         "אצלנו כולם מקבלים את היהלום 💎\n"
+         "והוא עולה בדיוק... בעצם, חינם!!\n\n"
+         "לאחר ישיבת הנהלה ארוכה החלטנו להשיק מסלולי מנוי:\n\n"
+         "🥉 חודש התנסות – עלינו\n"
+         "🥈 מנוי חודשי – תודה אחת (אפשר גם בלב)\n"
+         "🥇 מנוי לחצי שנה – רק לא לשכוח אותנו כשתהיו עשירים\n"
+         "💎 מנוי שנתי – לכו תקנו משהו יפה עם הכסף שחסכתם\n\n"
+         "המחלקה הכספית לא מרוצה.\n"
+         "אנחנו כן. 😎\n\n"
+         "💌 תעשו לחברים שלכם טובה ותשתפו איתם, היהלום מחכה להם 👇")
+
+
+def promo_buttons():
+    share = "https://t.me/share/url?" + urllib.parse.urlencode(
+        {"url": GROUP_LINK, "text": "בוט התראות מלאי לקודי PSN – בחינם, בלי מנויים 💎"})
+    return [[{"text": "📋 העתק קישור לקבוצה", "copy_text": {"text": GROUP_LINK}}],
+            [{"text": "📤 שתף עם חבר", "url": share}]]
+
+
 HELP = ("📖 <b>הוראות שימוש</b>\n\n"
         "הבוט בודק את כל המוצרים אוטומטית, ושולח הודעה כשמוצר חוזר למלאי וכשהוא אוזל.\n\n"
         "<b>פקודות:</b>\n"
@@ -641,7 +665,8 @@ HELP = ("📖 <b>הוראות שימוש</b>\n\n"
         "/status — מצב הבוט\n"
         "/stats — סטטיסטיקת מלאי ושעות חמות\n"
         "/menu — הצגת התפריט\n"
-        "/update — מה חדש בגרסה האחרונה\n\n"
+        "/update — מה חדש בגרסה האחרונה\n"
+        "/promo — פרסום הודעת \"המנויים\" עם כפתורי שיתוף (מנהלים בלבד)\n\n"
         "💡 קישור אמזון עם מוכר מסוים (smid=) יתריע רק כשהמוכר הזה מוכר.")
 
 
@@ -708,8 +733,12 @@ def process_updates(upd, products, state):
         parts = text.split(maxsplit=2)
         cmd = parts[0].split("@")[0].lower()
 
-        if cmd in ("/add", "/remove") and not is_admin(chat, msg):
-            send("🔒 רק מנהלי הקבוצה יכולים להוסיף או להסיר מוצרים.", chat)
+        if cmd in ("/add", "/remove", "/promo") and not is_admin(chat, msg):
+            send("🔒 רק מנהלי הקבוצה יכולים להשתמש בפקודה הזו.", chat)
+            continue
+
+        if cmd == "/promo":
+            send(PROMO, chat, buttons=promo_buttons())
             continue
 
         if cmd == "/add" and len(parts) >= 2:
