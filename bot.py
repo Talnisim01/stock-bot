@@ -4,7 +4,7 @@ Checks product pages and posts to the group when an item comes back in stock (an
 
 Two ways to run:
   python3 bot.py          one check cycle (used by GitHub Actions every 15 minutes)
-  python3 bot.py --loop   runs non-stop on your computer: instant replies, each product every ~CHECK_SECONDS (adaptive)
+  python3 bot.py --loop   runs non-stop on your computer: instant replies, each product page every ~60s (adaptive, /speed)
 
 Cloud backup: the computer saves its state + a heartbeat to the 'live' branch on GitHub.
 When the computer is silent for a while (asleep/off), GitHub Actions takes over until it's back.
@@ -46,7 +46,12 @@ TOKEN = os.environ.get("TELEGRAM_TOKEN") or CONFIG.get("TELEGRAM_TOKEN", "")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID") or CONFIG.get("TELEGRAM_CHAT_ID", "")
 CHECK_MINUTES = float(os.environ.get("CHECK_MINUTES") or CONFIG.get("CHECK_MINUTES", 5))
 # computer mode: how often EACH product is checked (seconds). Slows down by itself if Amazon blocks.
-CHECK_SECONDS = float(os.environ.get("CHECK_SECONDS") or CONFIG.get("CHECK_SECONDS", 90))
+CHECK_SECONDS = float(os.environ.get("CHECK_SECONDS") or CONFIG.get("CHECK_SECONDS", 60))
+
+
+def base_seconds(state):
+    """Seconds between checks of the same product page (set from the group with /speed)."""
+    return float(state.get("check_seconds") or CHECK_SECONDS)
 
 BLOCKED_WARN_HOURS = 3      # warn in the group after this long without a successful check
 KEEPALIVE_DAYS = 20
@@ -96,8 +101,16 @@ MENU = {"keyboard": [[BTN_AVAILABLE, BTN_ALL], [BTN_CHECK, BTN_STATUS], [BTN_STA
 
 # ---------- version & what's new ----------
 # When changing the bot: raise VERSION and add a block at the TOP of CHANGELOG.
-VERSION = "1.4"
+VERSION = "1.5"
 CHANGELOG = [
+    ("1.5", "11/10/2026", [
+        "⚡ בדיקות מהירות יותר: כל מוצר נבדק בערך כל דקה (במקום דקה וחצי)",
+        "🔗 מוצרים על אותו עמוד באמזון נבדקים בבקשה אחת, בלי לבזבז בדיקות",
+        "🔥🔥 בשעה הכי חמה של הבוקר הבוט בודק עוד יותר מהר",
+        "🧭 הבוט זוכר איזה עמוד של אמזון עובד כרגע (מחשב/מובייל) ומתחיל ממנו",
+        "🎚 פקודת /speed למנהלים: שינוי קצב הבדיקה ישר מהקבוצה",
+        "💎 פקודת /promo למנהלים: הודעת \"המנויים\" עם כפתורי העתקה ושיתוף",
+    ]),
     ("1.4", "29/09/2026", [
         "📊 סטטיסטיקה: כמה פעמים כל מוצר חזר למלאי, כמה זמן החזיק ובאילו שעות",
         "🔥 בשעות שבהן המלאי בדרך כלל חוזר, הבוט בודק מהר יותר (ובלילה לאט יותר)",
@@ -208,6 +221,8 @@ def hour_factor(state):
     h = now().hour
     if not sum(c):
         return 1.0, ""
+    if c[h] >= 5:
+        return 0.4, "🔥🔥 השעה הכי חמה"
     if c[h]:
         return 0.5, "🔥 שעה חמה"
     if c[(h - 1) % 24] or c[(h + 1) % 24]:
@@ -528,6 +543,59 @@ def detect_generic(page, product):
     return "unknown"
 
 
+def amazon_page(host, asin):
+    """Fetch a product page once (desktop or mobile, whichever worked last first). '' if blocked."""
+    warm_up(host)
+    kinds = [("desktop", f"https://{host}/dp/{asin}"), ("mobile", f"https://{host}/gp/aw/d/{asin}")]
+    if RUNTIME.get("prefer") == "mobile":
+        kinds.reverse()
+    for i, (kind, u) in enumerate(kinds):
+        try:
+            page = fetch(u)
+            if detect_amazon(page) != "unknown":
+                RUNTIME["prefer"] = kind
+                return page
+            print(f"  captcha ({kind})")
+            BLOCKS["soft"] += 1
+            RUNTIME["captchas"] = [t for t in RUNTIME["captchas"] if t > time.time() - 3600] + [time.time()]
+        except FetchError as e:
+            print(f"  HTTP {e.code} ({kind})")
+        except Exception as e:  # noqa: BLE001
+            print(f"  error ({kind}): {e}")
+        if i == 0:
+            time.sleep(random.uniform(3, 6))
+    return ""
+
+
+def group_key(p):
+    parts = amazon_parts(p["url"])
+    return f"{parts[0]}/{parts[1]}" if parts else p["url"]
+
+
+def groups_of(products):
+    """[(key, [(n, product), ...]), ...] — entries that share one Amazon page are checked together."""
+    out = {}
+    for n, p in enumerate(products, 1):
+        out.setdefault(group_key(p), []).append((n, p))
+    return list(out.items())
+
+
+def check_group(members, state):
+    """Check all entries of one page with a single request."""
+    items = state.setdefault("items", {})
+    first = members[0][1]
+    parts = amazon_parts(first["url"])
+    if parts:
+        page = amazon_page(parts[0], parts[1])
+        for n, p in members:
+            seller = amazon_parts(p["url"])[2]
+            status = detect_amazon(page, seller) if page else "unknown"
+            check_one(n, p, items.setdefault(p["url"], {"status": "unknown"}), state, result=(status, page))
+    else:
+        for n, p in members:
+            check_one(n, p, items.setdefault(p["url"], {"status": "unknown"}), state)
+
+
 def check(product):
     url = product["url"]
     try:
@@ -601,7 +669,7 @@ def msg_status(products, state):
     in_now = sum(1 for p in products if items.get(p["url"], {}).get("status") == "in")
     if LOOP_MODE:
         hf, tag = hour_factor(state)
-        per = CHECK_SECONDS * RUNTIME["slow"] * hf
+        per = base_seconds(state) * RUNTIME["slow"] * hf
         where = "💻 המחשב"
         speed = f"כל מוצר נבדק כל ~{int(per)} שניות" + (f" ({tag})" if tag else "")
         if RUNTIME["slow"] > 1.05:
@@ -666,7 +734,8 @@ HELP = ("📖 <b>הוראות שימוש</b>\n\n"
         "/stats — סטטיסטיקת מלאי ושעות חמות\n"
         "/menu — הצגת התפריט\n"
         "/update — מה חדש בגרסה האחרונה\n"
-        "/promo — פרסום הודעת \"המנויים\" עם כפתורי שיתוף (מנהלים בלבד)\n\n"
+        "/promo — פרסום הודעת \"המנויים\" עם כפתורי שיתוף (מנהלים בלבד)\n"
+        "/speed — קצב הבדיקה בשניות, למשל /speed 45 (מנהלים בלבד)\n\n"
         "💡 קישור אמזון עם מוכר מסוים (smid=) יתריע רק כשהמוכר הזה מוכר.")
 
 
@@ -733,8 +802,19 @@ def process_updates(upd, products, state):
         parts = text.split(maxsplit=2)
         cmd = parts[0].split("@")[0].lower()
 
-        if cmd in ("/add", "/remove", "/promo") and not is_admin(chat, msg):
+        if cmd in ("/add", "/remove", "/promo", "/speed") and not is_admin(chat, msg):
             send("🔒 רק מנהלי הקבוצה יכולים להשתמש בפקודה הזו.", chat)
+            continue
+
+        if cmd == "/speed":
+            if len(parts) >= 2 and parts[1].isdigit():
+                sec = max(20, min(600, int(parts[1])))
+                state["check_seconds"] = sec
+                send(f"⚡ עודכן: כל מוצר ייבדק בערך כל {sec} שניות "
+                     f"(בשעות חמות מהר יותר, ואם אמזון חוסמת — הבוט יאט לבד).", chat)
+            else:
+                send(f"⚡ כרגע: כל מוצר נבדק בערך כל {int(base_seconds(state))} שניות.\n"
+                     f"לשינוי: /speed ואחריו מספר שניות (20–600), למשל /speed 45", chat)
             continue
 
         if cmd == "/promo":
@@ -797,11 +877,11 @@ def process_updates(upd, products, state):
 OUT_CONFIRM = 2   # "sold out" needs 2 reads in a row (a single odd page must not kill a live alert)
 
 
-def check_one(n, p, st, state):
-    """Check one product, send/edit messages. Returns the status that was read."""
+def check_one(n, p, st, state, result=None):
+    """Check one product (or use a page already fetched), send/edit messages."""
     url = p["url"]
     print(f"[{hhmmss()}] checking {n}. {label(p)}")
-    status, page = check(p)
+    status, page = result if result else check(p)
     print(f"  -> {status}")
     if not p.get("name") and page:
         p["name"] = page_title(page) or ""
@@ -851,9 +931,8 @@ def check_one(n, p, st, state):
 
 def run_checks(products, state):
     """Check every product once (GitHub mode, and the 'check now' button)."""
-    items = state.setdefault("items", {})
-    for n, p in enumerate(products, 1):
-        check_one(n, p, items.setdefault(p["url"], {"status": "unknown"}), state)
+    for _, members in groups_of(products):
+        check_group(members, state)
         time.sleep(random.uniform(6, 12) if LOOP_MODE else 2)
 
 
@@ -976,11 +1055,13 @@ def main_loop():
     if CHAT_ID:
         announce_back(state)
         if state.get("announced_version") != VERSION:
+            if "check_seconds" not in state:      # 1.5: new default speed (old config said 90)
+                state["check_seconds"] = 60
             send(msg_changelog(1), menu=True)
             state["announced_version"] = VERSION
     state["backup_enabled"] = bool(GITHUB_TOKEN)
     backup = "cloud backup ON" if GITHUB_TOKEN else "cloud backup OFF (no GITHUB_TOKEN in config.json)"
-    print(f"MyRupeeBot v{VERSION} running - each product about every {CHECK_SECONDS:g}s ({ENGINE} mode, {backup}).")
+    print(f"MyRupeeBot v{VERSION} running - each product about every {base_seconds(state):g}s ({ENGINE} mode, {backup}).")
     print("Close this window to stop.")
 
     turn = 0              # which product is next
@@ -1003,12 +1084,12 @@ def main_loop():
             check_now = process_updates(upd, products, state)
             if check_now:
                 run_checks(products, state)
-                next_at = time.time() + CHECK_SECONDS / max(1, len(products))
+                next_at = time.time() + base_seconds(state) / max(1, len(groups_of(products)))
             elif products and time.time() >= next_at:
-                turn %= len(products)
-                p = products[turn]
+                groups = groups_of(products)
+                turn %= len(groups)
                 hard, soft = BLOCKS["count"], BLOCKS["soft"]
-                check_one(turn + 1, p, state.setdefault("items", {}).setdefault(p["url"], {"status": "unknown"}), state)
+                check_group(groups[turn][1], state)
                 slow = RUNTIME["slow"]
                 if BLOCKS["count"] > hard:
                     slow = min(slow * 1.5, 6)          # Amazon pushed back hard: ease off
@@ -1021,8 +1102,8 @@ def main_loop():
                 RUNTIME["slow"] = slow
                 turn += 1
                 hf, _ = hour_factor(state)             # faster in hours when restocks happen
-                gap = CHECK_SECONDS * slow * hf / len(products)
-                next_at = time.time() + max(6.0, gap * random.uniform(0.8, 1.2))
+                gap = base_seconds(state) * slow * hf / len(groups)
+                next_at = time.time() + max(5.0, gap * random.uniform(0.8, 1.2))
 
             last_iter = time.time()
             state["pc_heartbeat"] = time.time()
