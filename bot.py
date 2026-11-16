@@ -101,8 +101,12 @@ MENU = {"keyboard": [[BTN_AVAILABLE, BTN_ALL], [BTN_CHECK, BTN_STATUS], [BTN_STA
 
 # ---------- version & what's new ----------
 # When changing the bot: raise VERSION and add a block at the TOP of CHANGELOG.
-VERSION = "1.5"
+VERSION = "1.6"
 CHANGELOG = [
+    ("1.6", "16/11/2026", [
+        "🛡 שמירה בטוחה: כיבוי או הפעלה מחדש של המחשב באמצע שמירה כבר לא ימחקו את רשימת המוצרים",
+        "☁️ אם הרשימה במחשב אבדה, הבוט משחזר אותה אוטומטית מהגיבוי בענן",
+    ]),
     ("1.5", "11/10/2026", [
         "⚡ בדיקות מהירות יותר: כל מוצר נבדק בערך כל דקה (במקום דקה וחצי)",
         "🔗 מוצרים על אותו עמוד באמזון נבדקים בבקשה אחת, בלי לבזבז בדיקות",
@@ -233,17 +237,39 @@ def hour_factor(state):
 
 
 def load(path, default):
-    try:
-        with open(path, encoding="utf-8") as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return default
+    """Read JSON. A damaged file falls back to its .bak copy (never silently to empty)."""
+    for candidate in (path, path + ".bak"):
+        try:
+            with open(candidate, encoding="utf-8") as f:
+                data = json.load(f)
+            if candidate != path:
+                print(f"{os.path.basename(path)} was damaged - restored from backup")
+            return data
+        except FileNotFoundError:
+            continue
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+            print(f"{os.path.basename(candidate)} is damaged")
+            continue
+    return default
 
 
 def save(path, data):
-    with open(path, "w", encoding="utf-8") as f:
+    """Safe save: write a temp file, keep the previous good copy as .bak, then swap in one step.
+    (A power cut / reboot mid-write can no longer leave an empty or half-written file.)"""
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
         f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+    if os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                json.load(f)                      # only back up a file that is still valid
+            os.replace(path, path + ".bak")
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+            pass
+    os.replace(tmp, path)
 
 
 # ---------- telegram ----------
@@ -1051,6 +1077,11 @@ def main_loop():
     state = load(STATE_FILE, {})
     if GITHUB_TOKEN:
         products, state = adopt_cloud(products, state)
+        if not products:                                   # local list lost? take the cloud's
+            doc = store_get()
+            if doc and doc.get("products"):
+                products = doc["products"]
+                print(f"product list was empty - restored {len(products)} products from the cloud")
     CHAT_ID = CHAT_ID or state.get("chat_id", "")
     if CHAT_ID:
         announce_back(state)
